@@ -1,22 +1,3 @@
-"""
-Predicting Traffic Patterns for Autonomous Navigation
-------------------------------------------------------
-Interactive Streamlit prototype:
-
-    simulated multi-source sensors (GPS, IoT, CCTV, V2I, weather, incident reports)
-        -> reliability-weighted fusion (robust to missing readings)
-        -> ST-GNN next-step speed prediction
-        -> traffic-aware A* routing
-        -> current route vs. proactive predicted route
-
-IMPORTANT:
-- All data is simulated. The same simulator produces the training history
-  and the "live" window, so the model is evaluated on the data it serves.
-- The what-if incident is a controlled demonstration: an incident report is
-  injected into the latest observation and the ST-GNN predicts its effect.
-- This is a decision-support prototype, not a vehicle controller.
-"""
-
 import math
 
 import networkx as nx
@@ -37,20 +18,16 @@ st.set_page_config(
 )
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 SEED = 42
 
 N_NODES = 12
-HISTORY = 8                 # time steps of history fed to the model
-STEPS_PER_DAY = 24          # one step = one hour
+HISTORY = 8
+STEPS_PER_DAY = 24
 N_STEPS = STEPS_PER_DAY * 60
-TRAIN_FRACTION = 0.8        # chronological train/test split
+TRAIN_FRACTION = 0.8
 
-FREE_FLOW_SPEED = 60.0      # km/h
-MIN_SPEED = 8.0             # km/h
+FREE_FLOW_SPEED = 60.0
+MIN_SPEED = 8.0
 
 NODE_POSITIONS = {
     0: (0.0, 2.0), 1: (1.0, 3.0), 2: (2.0, 3.0), 3: (3.0, 2.0),
@@ -67,13 +44,10 @@ ROADS = [
     (10, 11),
 ]
 
-# Roads are a little longer than the straight line between intersections.
 ROAD_DETOUR_KM = 0.35
 
-# Per-node speed offsets (km/h); nodes 5 and 6 form a slower downtown core.
 NODE_OFFSET = np.array([0, 1, -1, 2, -2, -7, -6, 1, 2, -2, 3, 0], dtype=float)
 
-# name: (reliability weight used in fusion, simulated noise std in km/h)
 SOURCES = {
     "GPS": (0.95, 1.3),
     "IoT": (0.90, 1.8),
@@ -83,14 +57,11 @@ SOURCES = {
 SOURCE_COLS = {name: f"{name.lower()}_speed" for name in SOURCES}
 MISSING_RATE = 0.025
 
-INCIDENT_RATE = 0.12        # probability a new incident starts in a step
-INCIDENT_IMPACT = 18.0      # km/h lost at the incident node at full severity
-NEIGHBOR_SPILLOVER = 0.35   # share of severity felt at adjacent intersections
-RAIN_IMPACT = 6.0           # km/h lost at full rain intensity
+INCIDENT_RATE = 0.12
+INCIDENT_IMPACT = 18.0
+NEIGHBOR_SPILLOVER = 0.35
+RAIN_IMPACT = 6.0
 
-# Routing cost = travel time
-#              + CONGESTION_WEIGHT * congestion * travel time
-#              + INCIDENT_RISK_MIN * incident exposure
 CONGESTION_WEIGHT = 0.5
 INCIDENT_RISK_MIN = 4.0
 
@@ -101,10 +72,6 @@ INCIDENT_F = FEATURES.index("incident")
 EPOCHS = 40
 BATCH_SIZE = 64
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def distance(u, v):
     (x1, y1), (x2, y2) = NODE_POSITIONS[u], NODE_POSITIONS[v]
@@ -140,10 +107,6 @@ def error_metrics(y_true, y_pred):
     }
 
 
-# ============================================================
-# ROAD NETWORK
-# ============================================================
-
 def build_network():
     g = nx.Graph()
     for node, pos in NODE_POSITIONS.items():
@@ -157,7 +120,6 @@ G = build_network()
 
 
 def incident_field(node, severity):
-    """Incident signal at each node: full severity at the node, spillover at neighbours."""
     field = np.zeros(N_NODES)
     field[node] = severity
     for nb in G.neighbors(node):
@@ -174,12 +136,7 @@ def normalized_adjacency(g):
 A_HAT = normalized_adjacency(G)
 
 
-# ============================================================
-# SIMULATION + MULTI-SOURCE FUSION
-# ============================================================
-
 def simulate_ground_truth(rng):
-    """True speeds [time, node] with daily cycles, rain and incidents."""
     t = np.arange(N_STEPS)
     nodes = np.arange(N_NODES)
 
@@ -187,7 +144,6 @@ def simulate_ground_truth(rng):
     local = 3.0 * np.sin(0.45 * t[:, None] + 0.7 * nodes[None, :])
     base = 42.0 + daily[:, None] + local + NODE_OFFSET
 
-    # Rain intensity in [0, 1] as a slowly varying AR(1) process.
     rain = np.zeros(N_STEPS)
     level = 0.0
     for i in range(N_STEPS):
@@ -204,12 +160,8 @@ def simulate_ground_truth(rng):
                 incident[i:i + duration], incident_field(node, severity)
             )
 
-    # Keep the live window incident-free so the what-if incident is the
-    # only one in the demo.
     incident[-HISTORY:] = 0.0
 
-    # Incident reports lead the slowdown by one step: a report at t slows
-    # traffic at t + 1. This is what makes proactive prediction possible.
     slowdown = np.vstack([np.zeros((1, N_NODES)), incident[:-1]])
 
     speed = (
@@ -222,14 +174,12 @@ def simulate_ground_truth(rng):
 
 
 def fuse_sources(df):
-    """Reliability-weighted average over whichever sources reported."""
     obs = df[list(SOURCE_COLS.values())].to_numpy()
     weights = np.array([w for w, _ in SOURCES.values()])
 
     weight_sum = (~np.isnan(obs) * weights).sum(axis=1)
     fused = np.nansum(obs * weights, axis=1) / np.where(weight_sum > 0, weight_sum, np.nan)
 
-    # Only rows where every source is missing need interpolating.
     fused = (
         pd.Series(fused, index=df.index)
         .groupby(df["node"])
@@ -263,12 +213,10 @@ def build_dataset(seed=SEED):
 
 
 def to_grid(df, col):
-    """Long DataFrame column -> [time, node] array."""
     return df.pivot(index="time", columns="node", values=col).to_numpy()
 
 
 def feature_array(df):
-    """Model inputs [time, node, feature]."""
     tod = 2 * np.pi * (np.arange(N_STEPS) % STEPS_PER_DAY) / STEPS_PER_DAY
     per_node = lambda x: np.repeat(x[:, None], N_NODES, axis=1)
     return np.stack(
@@ -288,31 +236,16 @@ FEATURE_GRID = feature_array(DATA)
 NOW = N_STEPS - 1
 
 
-# ============================================================
-# ST-GNN MODEL
-# ============================================================
-
 class GraphConv(nn.Module):
-    """Graph convolution with a symmetric-normalised adjacency: H' = Â H W."""
-
     def __init__(self, in_features, out_features):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
 
     def forward(self, x, a_hat):
-        # x: [batch, time, nodes, features]
         return self.linear(torch.einsum("ij,btjf->btif", a_hat, x))
 
 
 class STGNN(nn.Module):
-    """
-    GraphConv -> GraphConv -> per-node GRU -> next-step speed.
-
-    Graph convolutions capture spatial spillover between intersections;
-    the GRU captures how each node's traffic evolves over the window.
-    The head predicts a change relative to the last observed speed.
-    """
-
     def __init__(self, in_features, hidden=32):
         super().__init__()
         self.gc1 = GraphConv(in_features, hidden)
@@ -359,7 +292,6 @@ def train_model(seed=SEED):
             optimizer.step()
     model.eval()
 
-    # Held-out evaluation on the later part of the timeline, against ground truth.
     with torch.no_grad():
         stgnn_pred = model(x[split:], A_HAT).numpy() * FREE_FLOW_SPEED
     persistence_pred = x[split:, -1, :, SPEED_F].numpy() * FREE_FLOW_SPEED
@@ -377,11 +309,6 @@ def train_model(seed=SEED):
 MODEL, TEST_METRICS, N_TEST = train_model()
 
 
-# ============================================================
-# TRAFFIC STATES
-# ============================================================
-# A traffic state is a DataFrame with columns: node, speed, congestion, incident.
-
 def current_state():
     window = FEATURE_GRID[NOW]
     speed = window[:, SPEED_F] * FREE_FLOW_SPEED
@@ -394,12 +321,6 @@ def current_state():
 
 
 def predict_next(incident=None):
-    """
-    ST-GNN prediction for the next step.
-
-    incident: optional (node, severity) what-if report injected into the
-    latest observation, exactly as incident reports appear in training.
-    """
     window = FEATURE_GRID[-HISTORY:].copy()
     if incident is not None:
         window[-1, :, INCIDENT_F] = np.maximum(window[-1, :, INCIDENT_F], incident_field(*incident))
@@ -418,10 +339,6 @@ def predict_next(incident=None):
 
 CURRENT_STATE = current_state()
 
-
-# ============================================================
-# TRAFFIC-AWARE A*
-# ============================================================
 
 def traffic_graph(state):
     s = state.set_index("node")
@@ -450,9 +367,6 @@ def traffic_graph(state):
 
 
 def heuristic(u, v):
-    # Straight-line travel time at free-flow speed. Every road is at least as
-    # long as the straight line and costs at least its free-flow travel time,
-    # so this never overestimates and A* stays optimal.
     return distance(u, v) / FREE_FLOW_SPEED * 60.0
 
 
@@ -486,11 +400,6 @@ def total_cost(breakdown):
 
 
 def compare_routes(start, destination, incident=None):
-    """
-    Plan on current traffic and on predicted traffic, then evaluate the
-    current route under the predicted state too, so both routes are
-    compared under the same future conditions.
-    """
     future_state = predict_next(incident)
     now_graph = traffic_graph(CURRENT_STATE)
     future_graph = traffic_graph(future_state)
@@ -510,11 +419,6 @@ def compare_routes(start, destination, incident=None):
 
 @st.cache_data
 def find_demo_incident(start, destination):
-    """
-    Pick the what-if incident that changes the route and saves the most
-    predicted travel time for this start/destination. Returns
-    (node, severity, minutes_saved) or None.
-    """
     best = None
     for node in G.nodes():
         if node in (start, destination):
@@ -527,10 +431,6 @@ def find_demo_incident(start, destination):
                 best = (node, severity, saved)
     return best
 
-
-# ============================================================
-# CHARTS
-# ============================================================
 
 def network_figure(state, current_route, predicted_route, incident=None):
     fig = go.Figure()
@@ -650,10 +550,6 @@ def fusion_chart(node, lookback=48):
     return fig
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
 node_options = list(G.nodes())
 node_name = lambda n: f"Node {n}"
 
@@ -700,10 +596,6 @@ elif incident_mode == "Manual":
     incident = (incident_node, incident_severity)
 
 
-# ============================================================
-# COMPUTE
-# ============================================================
-
 result = compare_routes(start_node, destination_node, incident)
 baseline_state = predict_next() if incident is not None else result["future_state"]
 
@@ -716,10 +608,6 @@ time_keep = total_time(result["current_future"])
 time_predicted = total_time(result["predicted_future"])
 time_saved = time_keep - time_predicted
 
-
-# ============================================================
-# HEADER + KPIs
-# ============================================================
 
 st.title("🚗 Predictive Traffic Intelligence")
 st.caption(
@@ -772,10 +660,6 @@ else:
         f"under predicted traffic. Add a what-if incident to see proactive rerouting."
     )
 
-
-# ============================================================
-# TABS
-# ============================================================
 
 tab_network, tab_prediction, tab_fusion, tab_routing, tab_data = st.tabs([
     "🗺️ Network & Routes",
